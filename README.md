@@ -1,4 +1,4 @@
-## When Modalities Heal Each Other: Bidirectional Restoration for Robust Optical-SAR Segmentation
+## WhenModalitiesHealEachOther:Degradation-Aware RestorationforRobustOptical-SARSemanticSegmentation
 
 
-![](Over_framework.pdf)
+![](Over_framework.png)
