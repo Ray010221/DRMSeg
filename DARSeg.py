@@ -1,0 +1,745 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from segmentation_models_pytorch.decoders.unet import Unet
+from segmentation_models_pytorch.decoders.unet.decoder import UnetDecoder
+from segmentation_models_pytorch.base import SegmentationHead
+
+
+def denorm_01(x):
+    return x * 0.5 + 0.5
+
+
+
+def gaussian_window(window_size, sigma, channel):
+    gauss = torch.Tensor([
+        float(torch.exp(torch.tensor(-(x - window_size//2)**2 / float(2*sigma**2))))
+        for x in range(window_size)
+    ])
+    gauss = gauss/gauss.sum()
+    window = gauss.unsqueeze(1) @ gauss.unsqueeze(0)
+    window = window.expand(channel, 1, window_size, window_size).contiguous()
+    return window
+
+
+def ssim(img1, img2, window_size=11, sigma=1.5, C1=0.01**2, C2=0.03**2):
+    """
+    img1, img2 shape: [B, 1, H, W], range [0,1]
+    """
+    B, C, H, W = img1.shape
+    window = gaussian_window(window_size, sigma, C).to(img1.device)
+
+    mu1 = F.conv2d(img1, window, padding=window_size//2, groups=C)
+    mu2 = F.conv2d(img2, window, padding=window_size//2, groups=C)
+
+    mu1_sq = mu1.pow(2)
+    mu2_sq = mu2.pow(2)
+    mu1_mu2 = mu1 * mu2
+
+    sigma1_sq = F.conv2d(img1 * img1, window, padding=window_size//2, groups=C) - mu1_sq
+    sigma2_sq = F.conv2d(img2 * img2, window, padding=window_size//2, groups=C) - mu2_sq
+    sigma12 = F.conv2d(img1 * img2, window, padding=window_size//2, groups=C) - mu1_mu2
+
+    ssim_map = ((2 * mu1_mu2 + C1) * (2 * sigma12 + C2)) / \
+               ((mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2))
+
+    return ssim_map
+
+
+def local_affinity(feat, k=5):
+    # feat: [B,C,H,W]
+    B, C, H, W = feat.shape
+    unfold = F.unfold(feat, k, padding=k//2)  # [B, C*k*k, HW]
+    center = feat.view(B, C, -1).unsqueeze(2)
+    neigh = unfold.view(B, C, k*k, -1)
+
+    sim = F.cosine_similarity(center, neigh, dim=1)  # [B, k*k, HW]
+    return sim
+
+
+
+class PrototypeBuffer(nn.Module):
+    def __init__(self, num_classes, feat_dims):
+        super().__init__()
+
+        self.num_classes = num_classes
+        self.momentum = 0.95
+        self.num_levels = len(feat_dims)
+
+        self.proto_mean = nn.ParameterList()
+        self.proto_std = nn.ParameterList()
+
+        for C in feat_dims:
+            self.proto_mean.append(nn.Parameter(torch.zeros(num_classes, C)))
+            self.proto_std.append(nn.Parameter(torch.ones(num_classes, C)))
+
+
+
+    @torch.no_grad()
+    def update(self, feat_list, labels, cloud_mask):
+        """
+        feat_list: list of multi-level features
+                   e.g. [[B,C1,H1,W1], [B,C2,H2,W2], ...]
+        labels: [B, H0, W0]  (original resolution)
+        cloud_mask: [B,1,H0,W0]
+        """
+
+        for level, feat in enumerate(feat_list):
+            B, C, H, W = feat.shape
+
+            lbl_lvl = F.interpolate(labels.unsqueeze(1).float(),
+                                    size=(H, W),
+                                    mode="nearest").long().squeeze(1)
+
+            cloud_lvl = F.interpolate(cloud_mask.float(),
+                                      size=(H, W),
+                                      mode="nearest").squeeze(1)
+
+            valid = 1 - cloud_lvl
+
+            for c in range(self.num_classes):
+                mask = (lbl_lvl == c).float() * valid
+
+                if mask.sum() < 64:
+                    continue
+
+                feat_c = (feat * mask.unsqueeze(1)).sum([0, 2, 3]) / mask.sum()
+
+                self.proto_mean[level][c] = \
+                    self.momentum * self.proto_mean[level][c] + \
+                    (1 - self.momentum) * feat_c
+                feat_var = (((feat - feat_c.view(1, C, 1, 1)) ** 2)
+                            * mask.unsqueeze(1)).sum([0, 2, 3]) / mask.sum()
+
+                self.proto_std[level][c] = \
+                    self.momentum * self.proto_std[level][c] + \
+                    (1 - self.momentum) * feat_var.sqrt()
+
+
+
+class LearnableGuidedFilter(nn.Module):
+    def __init__(self, in_channels, guide_channels):
+        super().__init__()
+        self.guide_proj = nn.Conv2d(guide_channels, in_channels, 1)
+        self.fusion = nn.Sequential(
+            nn.Conv2d(in_channels * 2, in_channels, 3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(in_channels, in_channels, 3, padding=1, groups=in_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(in_channels, in_channels, 1)
+        )
+
+        self.alpha = nn.Parameter(torch.zeros(1))
+
+    def forward(self, sar_feat, guide_feat):
+        guide_feat = self.guide_proj(guide_feat)
+        _, _, H, W = sar_feat.shape
+
+        x = torch.cat([sar_feat, guide_feat], dim=1)
+        edge = self.fusion(x)
+
+        return sar_feat + self.alpha * edge
+
+
+class SAR_EdgeEnhancer(nn.Module):
+    def __init__(self, sar_channels, guide_channels):
+        super().__init__()
+
+        self.blocks = nn.ModuleList([
+            LearnableGuidedFilter(sar_channels[i], guide_channels[i])
+            for i in range(len(sar_channels))
+        ])
+
+    def forward(self, sar_feats, guide_feats):
+        out = []
+        for i, blk in enumerate(self.blocks):
+            out.append(blk(sar_feats[i], guide_feats[i]))
+        return out
+
+def sar_structure_field(sar_feat, k=5):
+    """
+    sar_feat: [B, C, H, W]
+    return:   [B, 2, H, W]
+    """
+
+    gx = sar_feat[:, :, :, 1:] - sar_feat[:, :, :, :-1]
+    gy = sar_feat[:, :, 1:, :] - sar_feat[:, :, :-1, :]
+
+    gx = F.pad(gx, (0, 1, 0, 0))
+    gy = F.pad(gy, (0, 0, 0, 1))
+
+    gx = gx.mean(dim=1, keepdim=True)
+    gy = gy.mean(dim=1, keepdim=True)
+
+    gx = F.avg_pool2d(gx, k, stride=1, padding=k//2)
+    gy = F.avg_pool2d(gy, k, stride=1, padding=k//2)
+
+    mag = torch.sqrt(gx**2 + gy**2 + 1e-6)
+    gx = gx / (mag + 1e-6)
+    gy = gy / (mag + 1e-6)
+
+    flow = torch.cat([gx, gy], dim=1) * 0.05
+    return flow
+
+
+def warp_prototype(proto_feat, flow):
+    """
+    proto_feat: [B, C, H, W]
+    flow:       [B, 2, H, W]  (dx, dy)
+    """
+    B, C, H, W = proto_feat.shape
+
+    # base grid
+    yy, xx = torch.meshgrid(
+        torch.linspace(-1, 1, H, device=proto_feat.device),
+        torch.linspace(-1, 1, W, device=proto_feat.device),
+        indexing='ij'
+    )
+    base_grid = torch.stack([xx, yy], dim=-1)  # [H,W,2]
+    base_grid = base_grid.unsqueeze(0).repeat(B, 1, 1, 1)
+
+    # SAR structure warp
+    flow = flow.permute(0, 2, 3, 1)
+    grid = base_grid + flow
+
+    warped = F.grid_sample(
+        proto_feat,
+        grid,
+        mode='bilinear',
+        padding_mode='border',
+        align_corners=True
+    )
+    return warped
+
+def compute_centers_split(feat, seg, cloud_mask, num_cls, eps=1e-6):
+    """
+    feat:       [B,C,H,W]
+    seg:        [B,H,W]
+    cloud_mask: [B,1,H,W]
+    return:
+        mu_cloud: [B,K,C]
+        mu_clear: [B,K,C]
+        valid_c:  [B,K]
+        valid_n:  [B,K]
+    """
+    B, C, H, W = feat.shape
+    K = num_cls
+
+    feat = feat.view(B, C, -1)          # [B,C,HW]
+    seg  = seg.view(B, -1)              # [B,HW]
+    cloud = cloud_mask.view(B, -1).float()
+    clear = 1.0 - cloud
+
+    onehot = F.one_hot(seg, K).float()  # [B,HW,K]
+
+    # -------- cloud --------
+    w_c = onehot * cloud.unsqueeze(-1)
+    cnt_c = w_c.sum(1)                  # [B,K]
+    mu_c = torch.einsum('bch,bhk->bkc', feat, w_c)
+    mu_c = mu_c / (cnt_c.unsqueeze(-1) + eps)
+
+    # -------- clear --------
+    w_n = onehot * clear.unsqueeze(-1)
+    cnt_n = w_n.sum(1)
+    mu_n = torch.einsum('bch,bhk->bkc', feat, w_n)
+    mu_n = mu_n / (cnt_n.unsqueeze(-1) + eps)
+
+    valid_c = cnt_c > 5
+    valid_n = cnt_n > 5
+
+    return mu_c, mu_n, valid_c, valid_n
+
+
+def cross_region_similarity(mu_c, mu_n):
+    """
+    mu_c: [B,K,C]  cloud
+    mu_n: [B,K,C]  non-cloud
+    return: [B,K,K]
+    """
+    mu_c = F.normalize(mu_c, dim=-1)
+    mu_n = F.normalize(mu_n, dim=-1)
+    return torch.matmul(mu_c, mu_n.transpose(1, 2))
+
+
+def cloud_structure_loss(
+    opt_feat,
+    sar_feat,
+    seg1,
+    cloud_mask,
+    num_cls,
+    eps=1e-6
+):
+    # --- centers ---
+    opt_c, opt_n, vc1, vn1 = compute_centers_split(
+        opt_feat, seg1, cloud_mask, num_cls
+    )
+    sar_c, sar_n, vc2, vn2 = compute_centers_split(
+        sar_feat, seg1, cloud_mask, num_cls
+    )
+
+    # --- similarity ---
+    S_opt = cross_region_similarity(opt_c, opt_n)
+    S_sar = cross_region_similarity(sar_c, sar_n).detach()
+
+    # --- valid mask ---
+    valid = (vc1 & vn1 & vc2 & vn2)
+    mask = valid.unsqueeze(2) & valid.unsqueeze(1)
+    mask = mask.float()
+
+    loss = (
+        (S_opt - S_sar).abs() * mask
+    ).sum() / (mask.sum() + eps)
+
+    return loss
+
+
+
+class Segmentation(nn.Module):
+    def __init__(
+            self,
+            sar_channels=1,
+            opt_channels=3,
+            num_classes=1000,
+            backbone='resnet50',
+            decoder_channels=(256, 128, 64, 32, 16),
+    ):
+        super(Segmentation, self).__init__()
+        self.Unet_SAR = Unet(encoder_name=backbone,
+                             encoder_depth=5,
+                             encoder_weights="imagenet",
+                             classes=num_classes,
+                             in_channels=sar_channels,
+                             decoder_channels=decoder_channels,
+                             )
+
+        self.Unet_OPT = Unet(encoder_name=backbone,
+                             encoder_depth=5,
+                             encoder_weights="imagenet",
+                             classes=num_classes,
+                             in_channels=opt_channels,
+                             decoder_channels=decoder_channels,
+                             )
+
+        self.SAR2OPT_Decoder = UnetDecoder(
+            encoder_channels=[x * 2 for x in self.Unet_SAR.encoder.out_channels],
+            decoder_channels=decoder_channels,
+            n_blocks=5,
+            use_batchnorm=True,
+            center=False,
+            attention_type=None,
+        )
+
+        self.SAR2OPT_Decoder_Head = SegmentationHead(
+            in_channels=decoder_channels[-1],
+            out_channels=opt_channels,
+            activation='tanh',
+            kernel_size=3,
+        )
+
+        self.Fusion_Segmentation_Head1 = SegmentationHead(
+            in_channels=decoder_channels[-1]*2,
+            out_channels=num_classes,
+            activation=None,
+            kernel_size=3,
+        )
+
+        self.Fusion_Segmentation_Head2 = SegmentationHead(
+            in_channels=decoder_channels[-1] * 4,
+            out_channels=num_classes,
+            activation=None,
+            kernel_size=3,
+        )
+
+        self.SAR_Enhance_Decoder = UnetDecoder(
+            encoder_channels=self.Unet_SAR.encoder.out_channels,
+            decoder_channels=decoder_channels,
+            n_blocks=5,
+            use_batchnorm=True,
+            center=False,
+            attention_type=None,
+        )
+
+        self.SAR_Enhance_Decoder_Head = SegmentationHead(
+            in_channels=decoder_channels[-1],
+            out_channels=sar_channels,
+            activation='tanh',
+            kernel_size=3,
+        )
+
+        self.num_classes = num_classes
+        self.ce_loss = nn.CrossEntropyLoss(reduction='mean')
+
+        self.prototype_buffer = PrototypeBuffer(num_classes, self.Unet_OPT.encoder.out_channels)
+        self.SAR_EdgeEnhancer = SAR_EdgeEnhancer(sar_channels=self.Unet_SAR.encoder.out_channels, guide_channels=self.Unet_OPT.encoder.out_channels)
+
+    def compute_cloud_instance_flags(self, img_opt, img_sar, sam_masks, valid_mask):
+        """
+        img_opt:   [B,3,H,W]
+        img_sar:   [B,1,H,W]
+        sam_masks: [B,N,H,W]
+        valid_mask: [B,N]
+        """
+        B, N, H, W = sam_masks.shape
+        eps = 1e-6
+
+        opt01 = denorm_01(img_opt)
+        sar01 = denorm_01(img_sar)
+
+        gray = opt01.mean(1, keepdim=True)  # [B,1,H,W]
+
+        lp = torch.tensor([1 / 2, 1 / 2], device=opt01.device).view(1, 1, 1, 2)
+        hp = torch.tensor([1 / 2, -1 / 2], device=opt01.device).view(1, 1, 1, 2)
+
+        LL_r = F.conv2d(gray, lp, stride=(1, 2))  # [B,1,H,W/2]
+        LH_r = F.conv2d(gray, hp, stride=(1, 2))
+
+        LL_sar_r = F.conv2d(sar01, lp, stride=(1, 2))
+        LH_sar_r = F.conv2d(sar01, hp, stride=(1, 2))
+
+        lp_t = lp.transpose(2, 3)
+        hp_t = hp.transpose(2, 3)
+
+        LL = F.conv2d(LL_r, lp_t, stride=(2, 1))  # [B,1,H/2,W/2]
+        HL = F.conv2d(LL_r, hp_t, stride=(2, 1))
+        LH = F.conv2d(LH_r, lp_t, stride=(2, 1))
+        HH = F.conv2d(LH_r, hp_t, stride=(2, 1))
+
+        LL_sar = F.conv2d(LL_sar_r, lp_t, stride=(2, 1))
+        HL_sar = F.conv2d(LL_sar_r, hp_t, stride=(2, 1))
+        LH_sar = F.conv2d(LH_sar_r, lp_t, stride=(2, 1))
+        HH_sar = F.conv2d(LH_sar_r, hp_t, stride=(2, 1))
+
+        sam_w = F.interpolate(sam_masks, size=LL.shape[-2:], mode='nearest')  # [B,N,h,w]
+        m = sam_w.view(B, N, -1)
+        area = m.sum(-1) + eps  # [B,N]
+
+        def inst_mean(feat):  # [B,1,h,w]
+            f = feat.view(B, 1, -1)  # [B,1,hw]
+            num = (f * m).sum(-1)  # [B,N]
+            return num / area
+
+        low_diff = (LL - LL_sar).abs()
+        low_diff_mean = inst_mean(low_diff)
+
+        hf_energy = (LH ** 2 + HL ** 2 + HH ** 2)
+        hf_smooth = -inst_mean(hf_energy)
+
+        hf_diff = (LH - LH_sar).abs() + (HL - HL_sar).abs() + (HH - HH_sar).abs()
+        hf_diff_mean = inst_mean(hf_diff)
+        def norm(x):
+            xmin = x.min(1, keepdim=True)[0]
+            xmax = x.max(1, keepdim=True)[0]
+            return (x - xmin) / (xmax - xmin + eps)
+
+        f1 = norm(low_diff_mean)
+        f2 = norm(hf_smooth)
+        f3 = norm(hf_diff_mean)
+
+        cloud_score = 0.4 * f1 + 0.2 * f2 + 0.4 * f3
+
+        cloud_score = cloud_score - (1 - valid_mask) * 9999
+
+        is_cloud = (cloud_score > 0.7).float()
+
+        cloud_mask = (sam_masks * is_cloud[:, :, None, None]).sum(1, keepdim=True)
+        cloud_mask = (cloud_mask > 0).float()
+
+        return is_cloud, cloud_mask
+
+
+    def restore_cloud_region_multi(self, feat_list, sar_feats, cloud_mask, labels):
+        out = []
+        for level, feat in enumerate(feat_list):
+            B, C, H, W = feat.shape
+
+            label = F.interpolate(
+                labels.unsqueeze(1).float(),
+                size=(H, W),
+                mode="nearest"
+            ).long().squeeze(1)
+            if level:
+
+               cloud_down = F.interpolate(cloud_mask.float(), size=(H, W), mode="nearest")
+            else:
+                cloud_down = cloud_mask.float()  # [B,1,H,W]
+
+            proto_m = self.prototype_buffer.proto_mean[level][label]  # [B,H,W,C]
+            proto_s = self.prototype_buffer.proto_std[level][label]  # [B,H,W,C]
+
+            proto_m = proto_m.permute(0, 3, 1, 2)  # [B,C,H,W]
+            proto_s = proto_s.permute(0, 3, 1, 2)
+
+
+
+            if level < 0:
+                sar_feat_level = sar_feats[level]
+                flow = sar_structure_field(sar_feat_level)
+
+                proto_warped = warp_prototype(proto_m, flow.detach())
+
+                restored_cloud_feat = proto_m + 0.5 * proto_warped.detach()
+
+            else :
+                restored_cloud_feat = proto_m
+
+            phi = .8
+            final_feat = feat * (1.0 - cloud_down * 1.0) + restored_cloud_feat * (cloud_down * (1.0 - phi)) + feat * (
+                        cloud_down * phi)
+
+            out.append(final_feat)
+
+        return out
+
+
+    def multimodal_topk_instances(self,
+                                  sam_masks, valid_mask, is_cloud,
+                                  feat_opt, feat_sar, feat_sar2opt, feat_sar_enhanced,
+                                  K=5):
+        """
+        sam_masks:     [B,N,H,W]
+        valid_mask:    [B,N]
+        is_cloud:      [B,N]
+        feat_opt:      [B,C,H',W']
+        feat_sar:      [B,C,H',W']
+        """
+
+        B, N, H, W = sam_masks.shape
+        _, C, h, w = feat_opt.shape
+        eps = 1e-6
+        device = sam_masks.device
+        is_cloud = is_cloud.float()
+        valid_mask = valid_mask.float()
+
+        with torch.no_grad():
+            m = sam_masks
+
+            area = m.sum((2, 3)) + eps  # [B,N]
+            area_norm = area / (h * w)  # [B,N]
+
+            def region_mean(feat: torch.Tensor) -> torch.Tensor:  # feat: [B,C,h,w]
+                f = feat.unsqueeze(1)  # [B,1,C,h,w]
+                r_sum = (f * m.unsqueeze(2)).sum((3, 4)) # [B,N,C]
+                r = r_sum / area.unsqueeze(-1) # [B,N,C]
+                return r
+
+            r_opt = region_mean(feat_opt)
+            r_sar = region_mean(feat_sar)
+            r_s2o = region_mean(feat_sar2opt)
+            r_se = region_mean(feat_sar_enhanced)
+
+            C1 = F.cosine_similarity(r_opt, r_sar, dim=-1)  # [B,N]
+            C2 = F.cosine_similarity(r_opt, r_s2o, dim=-1)
+            C3 = F.cosine_similarity(r_sar, r_s2o, dim=-1)
+            C4 = F.cosine_similarity(r_opt, r_se, dim=-1)
+            C5 = F.cosine_similarity(r_sar, r_se, dim=-1)
+            C6 = F.cosine_similarity(r_s2o, r_se, dim=-1)
+            #
+            C = (C1 + C2 + C3 + C4 + C5 + C6) / 6
+
+            def region_background_mean(feat: torch.Tensor) -> torch.Tensor:
+                m_bg = 1.0 - m
+                area_bg = m_bg.sum((2, 3)) + eps
+
+                f = feat.unsqueeze(1)
+                r_bg_sum = (f * m_bg.unsqueeze(2)).sum((3, 4))
+
+                r_bg = r_bg_sum / area_bg.unsqueeze(-1)
+                return r_bg
+
+            r_opt_bg = region_background_mean(feat_opt)
+
+            D = 1.0 - F.cosine_similarity(r_opt, r_opt_bg, dim=-1)  # [B, N]
+
+            Q = (0.4 * C +
+                 0.3 * D +
+                 0.3 * area_norm)
+
+            Q = Q * (1 - 0.5 * is_cloud)
+            Q = Q - (1.0 - valid_mask) * 9999.0
+
+            K = min(K, N)
+            _, idx = torch.topk(Q, K, dim=1)  # [B,K]
+
+            batch_indices = torch.arange(B, device=device).unsqueeze(1)
+
+            topk = sam_masks[batch_indices, idx]
+
+            topk_mask = (topk.sum(1, keepdim=True) > 0).float()  # [B, 1, H, W]
+
+        return topk_mask
+
+
+    def trainSeg(self, img_sar, img_opt, label, SAM_mask, valid_mask):
+
+        # OPT + SAR Physical prior help mask with cloud
+        is_cloud, cloud_mask = self.compute_cloud_instance_flags(
+            img_opt, img_sar, SAM_mask, valid_mask
+        )
+
+        # segmentation with SAR2OPT
+        # SAR Seg
+        sar_features = self.Unet_SAR.encoder(img_sar)
+        sar_feature_cp = [x.clone().detach() for x in sar_features]
+        sar_decoder_feature = self.Unet_SAR.decoder(*sar_features)
+        sar_decoder_feature_cp = sar_decoder_feature.clone()
+        sar_logits = self.Unet_SAR.segmentation_head(sar_decoder_feature)
+        loss_ce_sar = self.ce_loss(sar_logits, label)
+
+        # OPT Seg
+        opt_features = self.Unet_OPT.encoder(img_opt)
+        opt_feature_cp = [x.clone().detach() for x in opt_features]
+        opt_decoder_feature = self.Unet_OPT.decoder(*opt_features)
+        opt_decoder_feature_cp = opt_decoder_feature.clone()
+        opt_logits = self.Unet_OPT.segmentation_head(opt_decoder_feature)
+        loss_ce_opt = self.ce_loss(opt_logits, label)
+
+        fusion_logit1 = self.Fusion_Segmentation_Head1(torch.cat([
+            sar_decoder_feature_cp,
+            opt_decoder_feature_cp
+        ], dim=1))
+
+        loss_ce_fusion1 = self.ce_loss(fusion_logit1, label)
+
+        # SAR2OPT
+        restored_feats = self.restore_cloud_region_multi(opt_feature_cp, sar_feature_cp, cloud_mask, torch.argmax(fusion_logit1, dim=1))
+
+        sar2opt = [torch.cat([x, y], dim=1) for x, y in zip(sar_feature_cp, restored_feats)]
+
+        # sar enhanced
+        sar_features_enhanced = self.SAR_EdgeEnhancer(sar_feature_cp, restored_feats)
+
+        sar2opt_decoder_feature = self.SAR2OPT_Decoder(*sar2opt)
+        sar2opt_decoder_feature_cp = sar2opt_decoder_feature.clone()
+
+        sar_enhanced_decoder_feature = self.SAR_Enhance_Decoder(*sar_features_enhanced)
+        sar_enhanced_decoder_feature_cp = sar_enhanced_decoder_feature.clone()
+
+
+        loss_struct = cloud_structure_loss(
+            sar2opt_decoder_feature_cp,
+            sar_decoder_feature_cp.detach(),
+            torch.argmax(fusion_logit1, dim=1),
+            cloud_mask,
+            self.num_classes
+        )
+
+
+        opt_recon = self.SAR2OPT_Decoder_Head(
+            sar2opt_decoder_feature
+        )
+
+        sar_enhanced = self.SAR_Enhance_Decoder_Head(sar_enhanced_decoder_feature)
+
+        loss_rec = F.l1_loss(opt_recon * (1 - cloud_mask), img_opt * (1 - cloud_mask))
+        opt_gray = 0.299 * img_opt[:, 0:1] + 0.587 * img_opt[:, 1:2] + 0.114 * img_opt[:, 2:3]
+        loss_enhanced = 0.7 * F.l1_loss(sar_enhanced, img_sar) + 0.3 * (
+                    1 - (ssim(denorm_01(sar_enhanced), denorm_01(opt_gray)) * (1 - cloud_mask)).mean())
+
+        # Prototype update
+        with torch.no_grad():
+            self.prototype_buffer.update(opt_feature_cp, torch.argmax(fusion_logit1, dim=1), cloud_mask)
+
+        topk_mask = self.multimodal_topk_instances(
+            SAM_mask,
+            valid_mask,
+            is_cloud,
+            opt_decoder_feature_cp,
+            sar_decoder_feature_cp,
+            sar2opt_decoder_feature_cp,
+            sar_enhanced_decoder_feature_cp,
+            K=5  # or proportion
+        )
+
+        fusion_logit2 = self.Fusion_Segmentation_Head2(torch.cat([opt_decoder_feature_cp,
+                                                                  sar_decoder_feature_cp,
+                                                                  sar2opt_decoder_feature_cp,
+                                                                  sar_enhanced_decoder_feature_cp
+                                                                  ], dim=1) * (1 + topk_mask))
+
+        loss_ce_fusion2 = self.ce_loss(fusion_logit2, label)
+
+        # Total loss
+        rho = 0.4
+        phi = 0.4
+        loss = loss_ce_sar + loss_ce_opt + loss_ce_fusion1 + loss_ce_fusion2 + rho * loss_rec + phi * loss_enhanced + .05 * loss_struct
+
+        return fusion_logit2, loss
+
+    def test(self, img_sar, img_opt, SAM_mask, valid_mask):
+
+        # OPT + SAR Physical prior help mask with cloud
+        is_cloud, cloud_mask = self.compute_cloud_instance_flags(
+            img_opt, img_sar, SAM_mask, valid_mask
+        )
+
+        # segmentation with SAR2OPT
+
+        # SAR Seg
+        sar_features = self.Unet_SAR.encoder(img_sar)
+        sar_feature_cp = [x.clone().detach() for x in sar_features]
+        sar_decoder_feature = self.Unet_SAR.decoder(*sar_features)
+        sar_decoder_feature_cp = sar_decoder_feature.clone()
+        sar_logits = self.Unet_SAR.segmentation_head(sar_decoder_feature)
+
+        # OPT Seg
+        opt_features = self.Unet_OPT.encoder(img_opt)
+        opt_feature_cp = [x.clone().detach() for x in opt_features]
+        opt_decoder_feature = self.Unet_OPT.decoder(*opt_features)
+        opt_decoder_feature_cp = opt_decoder_feature.clone()
+        opt_logits = self.Unet_OPT.segmentation_head(opt_decoder_feature)
+
+        fusion_logit1 = self.Fusion_Segmentation_Head1(torch.cat([sar_decoder_feature_cp,
+                                                                opt_decoder_feature_cp,
+                                                                ], dim=1)
+                                                     )
+        # SAR2OPT
+        restored_feats = self.restore_cloud_region_multi(opt_feature_cp, sar_feature_cp, cloud_mask, torch.argmax(fusion_logit1, dim=1))
+
+        sar2opt = [torch.cat([x, y], dim=1) for x, y in zip(sar_feature_cp, restored_feats)]
+        # sar2opt=restored_feats
+        sar2opt_decoder_feature = self.SAR2OPT_Decoder(*sar2opt)
+        sar2opt_decoder_feature_cp = sar2opt_decoder_feature.clone()
+
+        sar_features_enhanced = self.SAR_EdgeEnhancer(sar_feature_cp, restored_feats)
+        sar_enhanced_decoder_feature = self.SAR_Enhance_Decoder(*sar_features_enhanced)
+        sar_enhanced_decoder_feature_cp = sar_enhanced_decoder_feature.clone()
+
+        sar_enhanced = self.SAR_Enhance_Decoder_Head(sar_enhanced_decoder_feature)
+
+
+        opt_recon = self.SAR2OPT_Decoder_Head(
+            sar2opt_decoder_feature
+        )
+
+        topk_mask = self.multimodal_topk_instances(
+            SAM_mask,
+            valid_mask,
+            is_cloud,
+            opt_decoder_feature_cp,
+            sar_decoder_feature_cp,
+            sar2opt_decoder_feature_cp,
+            sar_enhanced_decoder_feature_cp,
+            K=5  # or proportion
+        )
+
+        fusion_logit2 = self.Fusion_Segmentation_Head2(torch.cat([opt_decoder_feature_cp,
+                                                                sar_decoder_feature_cp,
+                                                                sar2opt_decoder_feature_cp,
+                                                                sar_enhanced_decoder_feature_cp
+                                                                ], dim=1) * (1 + topk_mask))
+        return fusion_logit2, opt_recon, sar_enhanced
+
+
+if __name__ == '__main__':
+    model = Segmentation(num_classes=6).cuda()
+    sar = torch.randn(4, 1, 256, 256).cuda()
+    opt = torch.randn(4, 3, 256, 256).cuda()
+    label = torch.randint(0, 6, (4, 256, 256)).cuda()
+
+    SAM_mask = torch.randn(4, 10, 256, 256).cuda()
+    valid_mask = torch.randn(4, 10).cuda()
+
+    seg, loss = model.trainSeg(sar, opt, label, SAM_mask, valid_mask)
+    seg, opt_recon, sar_enhanced = model.test(sar, opt, SAM_mask, valid_mask)
+
+
