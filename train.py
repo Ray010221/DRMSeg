@@ -1,127 +1,128 @@
-"""Train the standalone optical--SAR DRM-Seg model."""
-
 import argparse
-import random
+import csv
+import hashlib
+import json
+import os
 from pathlib import Path
-
+import random
+import time
+os.environ.setdefault('HF_HUB_OFFLINE', '1')
 import numpy as np
 import torch
-from torch.cuda.amp import GradScaler, autocast
+from torch.cuda.amp import GradScaler
 from torch.utils.data import DataLoader
-from tqdm import tqdm
-
-try:
-    from .dataloader import OpticalSARDataset
-    from .model import DualConvNeXtV2Segmentation
-except ImportError:
-    from dataloader import OpticalSARDataset
-    from model import DualConvNeXtV2Segmentation
+from dataloader import FullPartitionDataset, collate_partitions
+from model import DRMSeg
+from engine import evaluate, save_atomic, schedule, seed_everything, run_epoch
 
 
-def set_seed(seed):
+def seed_worker(worker_id):
+    seed = torch.initial_seed() % 2 ** 32
     random.seed(seed)
     np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-
-
-def update_confusion(confusion, prediction, target, classes=6):
-    valid = (target >= 0) & (target < classes)
-    indices = target[valid] * classes + prediction[valid]
-    confusion += torch.bincount(indices, minlength=classes * classes).reshape(classes, classes).cpu()
-
-
-def metrics(confusion):
-    matrix = confusion.double()
-    intersection = matrix.diag()
-    union = matrix.sum(0) + matrix.sum(1) - intersection
-    iou = intersection / union.clamp_min(1)
-    return (intersection.sum() / matrix.sum().clamp_min(1)).item(), iou.mean().item(), iou.tolist()
-
-
-def run_epoch(model, loader, optimizer, scaler, device, amp):
-    model.train()
-    confusion = torch.zeros(6, 6, dtype=torch.long)
-    total_loss, steps = 0.0, 0
-    for batch in tqdm(loader, desc="train", leave=False):
-        sar = batch["img_sar"].to(device)
-        opt = batch["img_opt"].to(device)
-        label = batch["label"].to(device)
-        regions = batch["sam_masks"].to(device)
-        valid = batch["valid_mask"].to(device)
-        optimizer.zero_grad(set_to_none=True)
-        with autocast(enabled=amp):
-            logits, loss = model.trainSeg2(sar, opt, label, regions, valid)
-        if not torch.isfinite(loss):
-            continue
-        scaler.scale(loss).backward()
-        scaler.step(optimizer)
-        scaler.update()
-        update_confusion(confusion, logits.detach().argmax(1), label)
-        total_loss += loss.item()
-        steps += 1
-    oa, miou, _ = metrics(confusion)
-    return total_loss / max(steps, 1), oa, miou
-
-
-@torch.no_grad()
-def evaluate(model, loader, device):
-    model.eval()
-    confusion = torch.zeros(6, 6, dtype=torch.long)
-    for batch in tqdm(loader, desc="val", leave=False):
-        logits, _, _ = model.test(
-            batch["img_sar"].to(device), batch["img_opt"].to(device),
-            batch["sam_masks"].to(device), batch["valid_mask"].to(device)
-        )
-        update_confusion(confusion, logits.argmax(1), batch["label"])
-    return metrics(confusion)
+    torch.set_num_threads(1)
 
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--data-root", required=True)
-    parser.add_argument("--region-dir", default="sam_all_masks")
-    parser.add_argument("--output", required=True)
-    parser.add_argument("--epochs", type=int, default=100)
-    parser.add_argument("--batch-size", type=int, default=8)
-    parser.add_argument("--workers", type=int, default=0)
-    parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--weight-decay", type=float, default=0.05)
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--threshold", type=float, default=0.6)
-    parser.add_argument("--device", default="cuda:0" if torch.cuda.is_available() else "cpu")
-    parser.add_argument("--no-amp", action="store_true")
-    parser.add_argument("--pretrained", action="store_true")
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--data-root', default='dataset/xian523')
+    parser.add_argument('--region-dir', default='felzenszwalb_full_partitions')
+    parser.add_argument('--run-dir', required=True)
+    parser.add_argument('--epochs', type=int, default=100)
+    parser.add_argument('--batch-size', type=int, default=16)
+    parser.add_argument('--num-workers', '--workers', type=int, default=4)
+    parser.add_argument('--device', default='cuda:0')
+    parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--lr', type=float, default=0.0001)
+    parser.add_argument('--threshold', type=float, default=0.6)
+    parser.add_argument('--temperature', type=float, default=0.15)
+    parser.add_argument('--gamma', type=float, default=0.15)
+    parser.add_argument('--alpha', type=float, default=0.1)
+    parser.add_argument('--calibration-warmup', type=int, default=10)
+    parser.add_argument('--utility-every', type=int, default=4)
+    parser.add_argument('--utility-temperature', type=float, default=0.01)
+    parser.add_argument('--lambda-utility', type=float, default=1.0)
+    parser.add_argument('--lambda-prior', type=float, default=1.0)
+    parser.set_defaults(fusion_mode='adaptive_consistency', prototype_weight=1.0)
+    parser.add_argument('--opt-ce-weight', type=float, default=0.5)
+    parser.add_argument('--sar-ce-weight', type=float, default=0.5)
+    parser.add_argument('--seg1-ce-weight', type=float, default=0.5)
     args = parser.parse_args()
-    set_seed(args.seed)
-    device = torch.device(args.device)
-    train = OpticalSARDataset(Path(args.data_root) / "train", args.region_dir, True)
-    val = OpticalSARDataset(Path(args.data_root) / "val", args.region_dir, False)
-    common = dict(batch_size=args.batch_size, num_workers=args.workers,
-                  pin_memory=device.type == "cuda")
-    train_loader = DataLoader(train, shuffle=True, drop_last=True, **common)
-    val_loader = DataLoader(val, shuffle=False, **common)
-    model = DualConvNeXtV2Segmentation(pretrained=args.pretrained).to(device)
-    model.cloud_threshold = args.threshold
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    amp = device.type == "cuda" and not args.no_amp
-    scaler = GradScaler(enabled=amp)
-    output = Path(args.output)
-    output.parent.mkdir(parents=True, exist_ok=True)
-    best = -1.0
+    if args.num_workers < 0 or args.batch_size < 1 or args.epochs < 1:
+        raise ValueError('Invalid loader or epoch configuration.')
+    if not 0 <= args.prototype_weight <= 1:
+        raise ValueError('Prototype weight must be in [0,1].')
+    output = Path(args.run_dir)
+    if output.exists():
+        raise FileExistsError(f'Existing run is not overwritten: {output}')
+    seed_everything(args.seed)
+    torch.set_num_threads(8)
+    torch.cuda.set_device(args.device)
+    train_set = FullPartitionDataset(Path(args.data_root) / 'train', args.region_dir, train=True)
+    val_set = FullPartitionDataset(Path(args.data_root) / 'val', args.region_dir)
+    generator = torch.Generator().manual_seed(args.seed)
+    val_generator = torch.Generator().manual_seed(args.seed + 1)
+    common = dict(batch_size=args.batch_size, num_workers=args.num_workers, collate_fn=collate_partitions, pin_memory=True, worker_init_fn=seed_worker)
+    if args.num_workers:
+        common.update(persistent_workers=True, prefetch_factor=2)
+    train_loader = DataLoader(train_set, shuffle=True, drop_last=True, generator=generator, **common)
+    val_loader = DataLoader(val_set, shuffle=False, generator=val_generator, **common)
+    model = DRMSeg(gamma=args.gamma, alpha=args.alpha, threshold=args.threshold, temperature=args.temperature, opt_ce_weight=args.opt_ce_weight, sar_ce_weight=args.sar_ce_weight, seg1_ce_weight=args.seg1_ce_weight, pretrained=True).to(args.device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.05)
+    scheduler = schedule(optimizer, args.epochs * len(train_loader), 3 * len(train_loader))
+    scaler = GradScaler(enabled=True, init_scale=1024.0)
+    protected = [Path(__file__).resolve().parent / name for name in ('model.py', 'engine.py', 'dataloader.py', 'train.py')]
+    digests = {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in protected}
+    config = dict(
+        vars(args), model_type='joint_region_single_modal',
+        architecture='final_proto100_region_mlp_above_mean',
+        train_samples=len(train_set), val_samples=len(val_set),
+        initialization='ConvNeXtV2 local cached pretraining; new modules initialized directly',
+        optimizer=f'AdamW, shared lr={args.lr:g}, weight_decay=0.05',
+        segmentation_loss_weights=dict(opt=args.opt_ce_weight, sar=args.sar_ce_weight,
+                                       seg1=args.seg1_ce_weight, seg2=1.),
+        mask='Haar cues + bounded 6->16->1 regional calibration; M1 repair / M0 fusion eligibility',
+        rfusion='Strictly above eligible-region mean consistency',
+        optical_repair='100% class prototype inside mask; no SAR concatenation',
+        sar_repair='OPT-gated SAR residual; no concatenation',
+        final_fusion='Four-representation concatenation',
+        degradation_supervision=False, test_data_used_during_training=False,
+        parameters=sum(p.numel() for p in model.parameters()),
+        calibrator_parameters=sum(p.numel() for p in model.mask_refiner.parameters()),
+        source_sha256=digests)
+    output.mkdir(parents=True)
+    (output / 'config.json').write_text(json.dumps(config, indent=2), encoding='utf-8')
+    print(json.dumps(config, indent=2), flush=True)
+    (best, start) = (-1.0, time.perf_counter())
     for epoch in range(1, args.epochs + 1):
-        loss, train_oa, train_miou = run_epoch(model, train_loader, optimizer, scaler, device, amp)
-        val_oa, val_miou, val_iou = evaluate(model, val_loader, device)
-        print(f"Epoch {epoch:03d}: loss={loss:.4f} train_OA={train_oa:.4f} "
-              f"train_mIoU={train_miou:.4f} val_OA={val_oa:.4f} val_mIoU={val_miou:.4f}")
-        if val_miou >= best:
-            best = val_miou
-            torch.save({"model": model.state_dict(), "epoch": epoch,
-                        "val_oa": val_oa, "val_miou": val_miou,
-                        "val_iou": val_iou, "cloud_threshold": args.threshold,
-                        "backbone": "convnextv2_tiny"}, output)
-            print(f"Saved {output} (mIoU={best:.4f})")
+        epoch_start = time.perf_counter()
+        print(f'Starting epoch {epoch:03d}/{args.epochs}', flush=True)
+        training = run_epoch(model, train_loader, optimizer, scaler, scheduler, args.device, args, epoch)
+        validation = evaluate(model, val_loader, args.device)
+        improved = validation['seg2']['miou'] > best
+        best = max(best, validation['seg2']['miou'])
+        record = dict(epoch=epoch, seconds=time.perf_counter() - epoch_start, train=training, val=validation, best_val_miou=best)
+        with (output / 'history.jsonl').open('a', encoding='utf-8') as handle:
+            handle.write(json.dumps(record) + '\n')
+        row = dict(epoch=epoch, seconds=record['seconds'], loss=training['loss'], utility=training['utility'], prior=training['prior'], head_grad=training['head_grad'], utility_targets=training['utility_targets'], skipped=training['skipped'], val_oa=validation['seg2']['oa'], val_miou=validation['seg2']['miou'], **{f'val_{key}': value for (key, value) in validation['masks'].items()})
+        path = output / 'history.csv'
+        exists = path.exists()
+        with path.open('a', newline='', encoding='utf-8') as handle:
+            writer = csv.DictWriter(handle, fieldnames=list(row))
+            if not exists:
+                writer.writeheader()
+            writer.writerow(row)
+        print(f"Epoch {epoch:03d}/{args.epochs} loss={training['loss']:.4f} val_OA={validation['seg2']['oa']:.5f} val_mIoU={validation['seg2']['miou']:.5f} M0={validation['masks']['initial_area']:.3f} M1={validation['masks']['refined_area']:.3f} head_grad={training['head_grad']:.6f} seconds={record['seconds']:.1f}", flush=True)
+        payload = dict(model_type='joint_region_single_modal', model=model.state_dict(), args=vars(args), epoch=epoch, best_miou=best, val=validation, calibration_enabled=model.calibration_enabled)
+        if improved:
+            save_atomic(payload, output / 'best.pth')
+        if epoch <= 3 or epoch % 10 == 0 or epoch == args.epochs:
+            save_atomic(dict(payload, optimizer=optimizer.state_dict(), scheduler=scheduler.state_dict(), scaler=scaler.state_dict(), torch_rng=torch.get_rng_state(), cuda_rng=torch.cuda.get_rng_state_all(), loader_rng=generator.get_state()), output / 'last.pth')
+    checks = {str(path): hashlib.sha256(path.read_bytes()).hexdigest() == digests[str(path)] for path in protected}
+    (output / 'source_checks.json').write_text(json.dumps(checks, indent=2), encoding='utf-8')
+    if not all(checks.values()):
+        raise RuntimeError('A source file changed during training.')
+    print(f'Training complete in {time.perf_counter() - start:.1f}s; best val mIoU={best:.6f}', flush=True)
 
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
