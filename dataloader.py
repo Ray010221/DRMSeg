@@ -1,99 +1,66 @@
 from pathlib import Path
 import random
-
 import numpy as np
-import torch
 from PIL import Image, ImageEnhance
+import torch
 from torch.utils.data import Dataset
 from torchvision.transforms import functional as TF
 
-try:
-    from .mask_generation import load_candidate_masks
-except ImportError:
-    from mask_generation import load_candidate_masks
 
+class FullPartitionDataset(Dataset):
 
-class OpticalSARDataset(Dataset):
-    """Load ``opt/``, ``sar/``, ``lbl/`` and offline region ``.npy`` files.
-
-    Each split is expected to contain matching basenames. Images are resized
-    only when ``image_size`` is explicitly different from their stored size.
-    """
-
-    def __init__(self, root, region_dir="sam_all_masks", train=False,
-                 image_size=128, max_instances=10,
-                 opt_mean=(0.5, 0.5, 0.5), opt_std=(0.5, 0.5, 0.5),
-                 sar_mean=(0.5,), sar_std=(0.5,)):
+    def __init__(self, root, region_dir='felzenszwalb_full_partitions', train=False):
         self.root = Path(root)
-        self.train = train
-        self.image_size = image_size
-        self.max_instances = max_instances
-        self.opt_mean, self.opt_std = opt_mean, opt_std
-        self.sar_mean, self.sar_std = sar_mean, sar_std
-        self.opt_dir = self.root / "opt"
-        self.sar_dir = self.root / "sar"
-        self.label_dir = self.root / "lbl"
         self.region_dir = self.root / region_dir
-        self.ids = sorted(path.stem for path in self.sar_dir.glob("*.jpg"))
+        self.train = train
+        self.ids = sorted((path.stem for path in (self.root / 'sar').glob('*.jpg')))
         if not self.ids:
-            raise FileNotFoundError(f"No SAR .jpg files found in {self.sar_dir}")
+            raise FileNotFoundError(self.root / 'sar')
+        for sample_id in self.ids:
+            for path in (self.root / 'opt' / f'{sample_id}.jpg', self.root / 'lbl' / f'{sample_id}.png', self.region_dir / f'{sample_id}.npy'):
+                if not path.is_file():
+                    raise FileNotFoundError(path)
 
     def __len__(self):
         return len(self.ids)
 
-    def _image(self, path, mode):
-        image = Image.open(path).convert(mode)
-        if image.size != (self.image_size, self.image_size):
-            image = image.resize((self.image_size, self.image_size), Image.BILINEAR)
-        tensor = TF.to_tensor(image)
-        return TF.normalize(tensor,
-                            self.opt_mean if mode == "RGB" else self.sar_mean,
-                            self.opt_std if mode == "RGB" else self.sar_std)
-
     def __getitem__(self, index):
         sample_id = self.ids[index]
-        opt = Image.open(self.opt_dir / f"{sample_id}.jpg").convert("RGB")
-        sar = Image.open(self.sar_dir / f"{sample_id}.jpg").convert("L")
-        label = Image.open(self.label_dir / f"{sample_id}.png").convert("L")
-        if opt.size != (self.image_size, self.image_size):
-            opt = opt.resize((self.image_size, self.image_size), Image.BILINEAR)
-            sar = sar.resize((self.image_size, self.image_size), Image.BILINEAR)
-            label = label.resize((self.image_size, self.image_size), Image.NEAREST)
-
-        masks, valid = load_candidate_masks(
-            self.region_dir / f"{sample_id}.npy",
-            max_instances=self.max_instances,
-            image_size=self.image_size,
-        )
-
-        if self.train and random.random() < 0.5:
-            opt, sar, label = opt.transpose(Image.FLIP_LEFT_RIGHT), sar.transpose(Image.FLIP_LEFT_RIGHT), label.transpose(Image.FLIP_LEFT_RIGHT)
-            masks = torch.flip(masks, dims=(-1,))
-        if self.train and random.random() < 0.5:
-            opt = ImageEnhance.Brightness(opt).enhance(1.2)
-
-        opt_tensor = TF.normalize(TF.to_tensor(opt), self.opt_mean, self.opt_std)
-        sar_tensor = TF.normalize(TF.to_tensor(sar), self.sar_mean, self.sar_std)
-        label_tensor = torch.from_numpy(np.asarray(label, dtype=np.int64))
-        return {
-            "id": sample_id,
-            "img_opt": opt_tensor,
-            "img_sar": sar_tensor,
-            "label": label_tensor,
-            "sam_masks": masks.float(),
-            "valid_mask": valid.float(),
-        }
+        with Image.open(self.root / 'opt' / f'{sample_id}.jpg') as image:
+            opt = image.convert('RGB')
+        with Image.open(self.root / 'sar' / f'{sample_id}.jpg') as image:
+            sar = image.convert('L')
+        with Image.open(self.root / 'lbl' / f'{sample_id}.png') as image:
+            label = image.convert('L')
+        partition = np.load(self.region_dir / f'{sample_id}.npy')
+        if partition.ndim != 2 or partition.shape != (opt.height, opt.width):
+            raise ValueError(f'Expected full HxW partition for {sample_id}')
+        if sar.size != opt.size or label.size != opt.size:
+            raise ValueError(f'Image/label dimensions differ for {sample_id}')
+        partition_image = Image.fromarray(partition.astype(np.int32), mode='I')
+        if self.train:
+            angle = random.uniform(-180, 180)
+            (opt, sar, label) = [image.rotate(angle) for image in (opt, sar, label)]
+            partition_image = partition_image.rotate(angle, fillcolor=-1)
+            for enhancer in (ImageEnhance.Brightness, ImageEnhance.Color, ImageEnhance.Contrast):
+                if random.random() > 0.5:
+                    opt = enhancer(opt).enhance(1.5)
+        partition = np.array(partition_image, dtype=np.int32)
+        (labels, remapped) = np.unique(partition, return_inverse=True)
+        regions = torch.from_numpy(remapped.reshape(partition.shape).astype(np.int64))
+        masks = torch.nn.functional.one_hot(regions, num_classes=len(labels)).permute(2, 0, 1)
+        return {'id': sample_id, 'img_opt': TF.normalize(TF.to_tensor(opt), (0.5,) * 3, (0.5,) * 3), 'img_sar': TF.normalize(TF.to_tensor(sar), (0.5,), (0.5,)), 'label': torch.from_numpy(np.array(label, dtype=np.int64)), 'sam_masks': masks.float()}
 
 
-def build_dataloaders(data_root, region_dir="sam_all_masks", batch_size=8,
-                      workers=0, image_size=128, max_instances=10):
-    from torch.utils.data import DataLoader
-
-    train = OpticalSARDataset(Path(data_root) / "train", region_dir, True, image_size, max_instances)
-    val = OpticalSARDataset(Path(data_root) / "val", region_dir, False, image_size, max_instances)
-    test = OpticalSARDataset(Path(data_root) / "test", region_dir, False, image_size, max_instances)
-    kwargs = dict(batch_size=batch_size, num_workers=workers,
-                  pin_memory=torch.cuda.is_available())
-    return (DataLoader(train, shuffle=True, drop_last=True, **kwargs),
-            DataLoader(val, shuffle=False, **kwargs),
-            DataLoader(test, shuffle=False, **kwargs))
+def collate_partitions(samples):
+    max_regions = max((sample['sam_masks'].shape[0] for sample in samples))
+    (height, width) = samples[0]['label'].shape
+    masks = torch.zeros(len(samples), max_regions, height, width)
+    valid = torch.zeros(len(samples), max_regions)
+    for (index, sample) in enumerate(samples):
+        count = sample['sam_masks'].shape[0]
+        masks[index, :count] = sample['sam_masks']
+        valid[index, :count] = 1
+    if not torch.all(masks.sum(1) == 1):
+        raise ValueError('Each pixel must belong to exactly one graph region')
+    return {'id': [sample['id'] for sample in samples], **{key: torch.stack([sample[key] for sample in samples]) for key in ('img_opt', 'img_sar', 'label')}, 'sam_masks': masks, 'valid_mask': valid}
